@@ -1,0 +1,132 @@
+name: 'Build and Push Image'
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'dockerfile'
+      - 'entrypoint.sh'
+    
+  workflow_dispatch: {}
+
+jobs:
+  define-build:
+    name: 'Define Build'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Set Matrix'
+        id: matrix
+        run: |
+          echo "matrix=$(cat <<'EOF' | jq -c .
+            [
+              {
+                "arch": "amd64",
+                "os": "ubuntu-22.04",
+                "platform": "linux/amd64"
+              },
+              {
+                "arch": "arm64",
+                "os": "ubuntu-22.04-arm",
+                "platform": "linux/arm64"
+              }
+            ]
+          EOF)" >> "$GITHUB_OUTPUT"
+          
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+          
+  build:
+    needs: ['define-build']
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.define-build.outputs.matrix) }}
+
+    name: 'Build ${{ matrix.platform }}'
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 'Checkout repository'
+        uses: actions/checkout@v4
+
+      - name: 'Log in to GitHub Container Registry'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Build and push image (${{ matrix.platform }})'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: './dockerfile'
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            NGINX_VERSION=1.29.1
+            NGINX_RTMP_VERSION=master
+          push: true
+          tags: |
+            ghcr.io/mqxx/nginx-rtmp:${{ matrix.arch }}-${{ github.sha }}
+            ghcr.io/mqxx/nginx-rtmp:${{ matrix.arch }}-latest
+            
+    outputs:
+      matrix: ${{ needs.define-build.outputs.matrix }}
+      
+  create-manifest:
+    needs: ['build']
+    name: 'Create Manifest'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 'Log in to GitHub Container Registry'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Create and push multi-arch manifest'
+        run: |
+          MATRIX='${{ needs.build.outputs.matrix }}'
+
+          IMAGES_LATEST=$(echo "$MATRIX" | jq -r '.[] | .arch' | xargs -n1 -I{} echo "ghcr.io/mqxx/nginx-rtmp:{}-latest")
+          IMAGES_SHA=$(echo "$MATRIX" | jq -r '.[] | .arch' | xargs -n1 -I{} echo "ghcr.io/mqxx/nginx-rtmp:{}-${GITHUB_SHA}")
+          
+          echo "Latest images: $IMAGES_LATEST"
+          echo "SHA images: $IMAGES_SHA"
+          
+          docker manifest create ghcr.io/mqxx/nginx-rtmp:latest $IMAGES_LATEST
+          docker manifest push ghcr.io/mqxx/nginx-rtmp:latest
+          
+          docker manifest create ghcr.io/mqxx/nginx-rtmp:${GITHUB_SHA} $IMAGES_SHA
+          docker manifest push ghcr.io/mqxx/nginx-rtmp:${GITHUB_SHA}
+          
+    outputs:
+      matrix: ${{ needs.build.outputs.matrix }}
+      
+  verify-manifest:
+    name: 'Verify Manifest'
+    runs-on: ubuntu-latest
+    needs: ['create-manifest']
+
+    steps:
+      - name: 'Verify'
+        run: |
+          ARCHS=$(echo '${{ needs.create-manifest.outputs.matrix }}' | jq -r '.[] | .arch')
+          OUTPUT=$(docker buildx imagetools inspect ghcr.io/mqxx/nginx-rtmp:latest)
+          echo "$OUTPUT"
+          for arch in $ARCHS; do
+            if ! echo "$OUTPUT" | grep -q "$arch"; then
+              echo -e "\x1b[1;31mPlatform $arch is missing in manifest."
+              exit 1
+            fi
+          done
+          echo -e "\x1b[1;32mAll expected platforms found in manifest."
